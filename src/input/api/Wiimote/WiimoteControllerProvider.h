@@ -121,6 +121,7 @@ private:
 	void rotate_ir(WiimoteState& wiimote_state);
 	void calculate_ir_position(WiimoteState& wiimote_state);
 	int parse_ir(WiimoteState& wiimote_state, const uint8* data);
+	bool parse_motion_plus(WiimoteState& wiimote_state, const uint8* data);
 
 	void request_extension(size_t index);
 	void detect_motion_plus(size_t index);

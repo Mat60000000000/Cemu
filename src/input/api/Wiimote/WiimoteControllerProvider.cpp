@@ -12,6 +12,93 @@
 
 #include <numbers>
 #include <queue>
+#include <array>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+
+namespace
+{
+	struct GyroConfig
+	{
+		float sign[3] = {1.0f, 1.0f, 1.0f}; // pitch -> x, yaw -> y, roll -> z
+		float gain = 1.0f;
+	};
+
+	// Optional tuning through environment variables (read once):
+	//   CEMU_WIIMOTE_GYRO=<sx>,<sy>,<sz>   e.g. "1,-1,1" flips the yaw axis (values: 1 or -1 for pitch,yaw,roll)
+	//   CEMU_WIIMOTE_GYRO_GAIN=<float>     overall gyro scale (default 1.0)
+	const GyroConfig& get_gyro_config()
+	{
+		static const GyroConfig config = []()
+		{
+			GyroConfig c;
+			if (const char* env = std::getenv("CEMU_WIIMOTE_GYRO"))
+			{
+				float v[3];
+				if (std::sscanf(env, "%f,%f,%f", &v[0], &v[1], &v[2]) == 3)
+				{
+					for (int i = 0; i < 3; ++i)
+						c.sign[i] = v[i] < 0.0f ? -1.0f : 1.0f;
+				}
+			}
+			if (const char* env = std::getenv("CEMU_WIIMOTE_GYRO_GAIN"))
+			{
+				const float g = (float)std::atof(env);
+				if (g > 0.0f)
+					c.gain = g;
+			}
+			cemuLog_log(LogType::Force, "Wiimote gyro config: signs {} {} {}, gain {}", c.sign[0], c.sign[1], c.sign[2], c.gain);
+			return c;
+		}();
+		return config;
+	}
+
+	// Distance (in normalized camera coordinates, 1.0 = full width) under which two IR dots are considered to be the same light source.
+	// Some sensor bars (e.g. the DolphinBar) show up as 3 or 4 dots instead of 2, which confuses the pointer tracking.
+	//   CEMU_WIIMOTE_IR_MERGE=<float>   (default 0.06, 0 disables)
+	float get_ir_merge_distance()
+	{
+		static const float distance = []()
+		{
+			float d = 0.06f;
+			if (const char* env = std::getenv("CEMU_WIIMOTE_IR_MERGE"))
+				d = (float)std::atof(env);
+			cemuLog_log(LogType::Force, "Wiimote IR dot merge distance: {}", d);
+			return d;
+		}();
+		return distance;
+	}
+
+	void merge_close_ir_dots(std::array<IRDot, 4>& dots)
+	{
+		const float limit = get_ir_merge_distance();
+		if (limit <= 0.0f)
+			return;
+
+		for (size_t i = 0; i < dots.size(); ++i)
+		{
+			if (!dots[i].visible)
+				continue;
+
+			for (size_t j = i + 1; j < dots.size(); ++j)
+			{
+				if (!dots[j].visible)
+					continue;
+
+				const float dx = dots[i].pos.x - dots[j].pos.x;
+				const float dy = (dots[i].pos.y - dots[j].pos.y) * 0.75f; // y range is 768 instead of 1024
+				if (std::sqrt(dx * dx + dy * dy) < limit)
+				{
+					dots[i].pos = (dots[i].pos + dots[j].pos) * 0.5f;
+					dots[j].visible = false;
+					dots[j].pos = {};
+				}
+			}
+		}
+	}
+}
+
 
 void WiimoteControllerProvider::StartThreads()
 {
@@ -256,6 +343,7 @@ void WiimoteControllerProvider::reader_thread()
 			read_lock.unlock();
 
 			bool update_report = false;
+			bool motion_plus_updated = false;
 
 			const uint8* data = read_data->data();
 			const auto id = (InputReportId)*data;
@@ -511,6 +599,8 @@ void WiimoteControllerProvider::reader_thread()
 					// 35 BB BB AA AA AA EE EE EE EE EE EE EE EE EE EE EE EE EE EE EE EE
 					new_state.buttons = *(uint16*)data & (~0x60E0);
 					parse_acceleration(new_state, data);
+					if (new_state.m_extension.index() == 0)
+						motion_plus_updated = parse_motion_plus(new_state, data);
 					break;
 				}
 			case kDataCoreIRExt:
@@ -526,6 +616,9 @@ void WiimoteControllerProvider::reader_thread()
 					new_state.buttons = *(uint16*)data & (~0x60E0);
 					parse_acceleration(new_state, data);
 					data += parse_ir(new_state, data); // 10
+
+					if (new_state.m_extension.index() == 0)
+						motion_plus_updated = parse_motion_plus(new_state, data);
 
 					std::visit(
 						overloaded
@@ -726,13 +819,40 @@ void WiimoteControllerProvider::reader_thread()
 			float zero4[4]{};
 
 
-			new_state.motion_sample = MotionSample(
-				acc,
-				glm::length(tacc - pacc),
-				zero3,
-				zero3,
-				zero4
-			);
+			if (new_state.m_motion_plus && new_state.m_motion_plus->valid)
+			{
+				// real MotionPlus gyro: fuse it with the accelerometer to get orientation/gyro like the DSU/SDL providers do
+				const auto now_ts = std::chrono::high_resolution_clock::now();
+				if (motion_plus_updated)
+				{
+					float dt = 0.0f;
+					if (new_state.m_last_motion_timestamp.time_since_epoch().count() != 0)
+						dt = std::chrono::duration<float>(now_ts - new_state.m_last_motion_timestamp).count();
+					new_state.m_last_motion_timestamp = now_ts;
+					if (dt > 0.0f && dt < 0.25f)
+					{
+						const auto& cfg = get_gyro_config();
+						const auto& rate = new_state.m_motion_plus->rate; // pitch, yaw, roll (rad/s)
+						new_state.motion_handler.processMotionSample(
+							dt,
+							rate.x * cfg.sign[0] * cfg.gain,
+							rate.y * cfg.sign[1] * cfg.gain,
+							rate.z * cfg.sign[2] * cfg.gain,
+							acc[0], acc[1], acc[2]);
+					}
+				}
+				new_state.motion_sample = new_state.motion_handler.getMotionSample();
+			}
+			else
+			{
+				new_state.motion_sample = MotionSample(
+					acc,
+					glm::length(tacc - pacc),
+					zero3,
+					zero3,
+					zero4
+				);
+			}
 
 			std::unique_lock data_lock(wiimote.mutex);
 			wiimote.state = new_state;
@@ -872,6 +992,56 @@ void WiimoteControllerProvider::calculate_ir_position(WiimoteState& wiimote_stat
 }
 
 
+bool WiimoteControllerProvider::parse_motion_plus(WiimoteState& wiimote_state, const uint8* data)
+{
+	if (!wiimote_state.m_motion_plus)
+		return false;
+
+	// MotionPlus frame (extension bytes): bit1 of the last byte is set, bit0 is clear.
+	// Anything else is an inactive MotionPlus or a passthrough extension frame.
+	if ((data[5] & 0x03) != 0x02)
+		return false;
+
+	auto& mp = *wiimote_state.m_motion_plus;
+
+	const uint16 yaw = (uint16)data[0] | ((uint16)(data[3] & 0xFC) << 6);
+	const uint16 roll = (uint16)data[1] | ((uint16)(data[4] & 0xFC) << 6);
+	const uint16 pitch = (uint16)data[2] | ((uint16)(data[5] & 0xFC) << 6);
+
+	mp.slow_yaw = (data[3] & 0x02) != 0;
+	mp.slow_pitch = (data[3] & 0x01) != 0;
+	mp.slow_roll = (data[4] & 0x02) != 0;
+	mp.extension_connected = (data[4] & 0x01) != 0;
+	mp.orientation = glm::vec3((float)yaw, (float)roll, (float)pitch); // raw values (yaw, roll, pitch)
+
+	// 14 bit values around 8192. Slow mode: ~440 deg/s full scale, fast mode: ~2000 deg/s.
+	constexpr float kSlowDpsPerUnit = 440.0f / 8192.0f;
+	constexpr float kFastDpsPerUnit = 2000.0f / 8192.0f;
+	constexpr float kZero = 8192.0f;
+
+	glm::vec3 dps; // pitch, yaw, roll
+	dps.x = ((float)pitch - kZero) * (mp.slow_pitch ? kSlowDpsPerUnit : kFastDpsPerUnit);
+	dps.y = ((float)yaw - kZero) * (mp.slow_yaw ? kSlowDpsPerUnit : kFastDpsPerUnit);
+	dps.z = ((float)roll - kZero) * (mp.slow_roll ? kSlowDpsPerUnit : kFastDpsPerUnit);
+
+	// the zero offset is estimated while the controller is (almost) still: running average at first, slow adaptation afterwards
+	const bool still = glm::abs(dps.x - mp.bias_dps.x) < 4.0f && glm::abs(dps.y - mp.bias_dps.y) < 4.0f && glm::abs(dps.z - mp.bias_dps.z) < 4.0f;
+	if (mp.bias_samples < 100)
+	{
+		// initial calibration, assumes the controller lies still when it connects
+		++mp.bias_samples;
+		mp.bias_dps += (dps - mp.bias_dps) / (float)mp.bias_samples;
+	}
+	else if (still)
+	{
+		mp.bias_dps += (dps - mp.bias_dps) * 0.002f;
+	}
+
+	mp.rate = (dps - mp.bias_dps) * 0.0174533f; // rad/s
+	mp.valid = mp.bias_samples >= 100;
+	return mp.valid;
+}
+
 sint32 WiimoteControllerProvider::parse_ir(WiimoteState& wiimote_state, const uint8* data)
 {
 	switch (wiimote_state.ir_camera.mode)
@@ -908,6 +1078,7 @@ sint32 WiimoteControllerProvider::parse_ir(WiimoteState& wiimote_state, const ui
 					dot2.pos = {};
 			}
 
+			merge_close_ir_dots(wiimote_state.ir_camera.dots);
 			rotate_ir(wiimote_state);
 			calculate_ir_position(wiimote_state);
 			return sizeof(BasicIR) * 2;
@@ -933,6 +1104,7 @@ sint32 WiimoteControllerProvider::parse_ir(WiimoteState& wiimote_state, const ui
 					dot.pos = {};
 			}
 
+			merge_close_ir_dots(wiimote_state.ir_camera.dots);
 			rotate_ir(wiimote_state);
 			calculate_ir_position(wiimote_state);
 			return sizeof(ExtendedIR) * 4;
@@ -1039,7 +1211,7 @@ void WiimoteControllerProvider::update_report_type(size_t index)
 	std::shared_lock read_lock(m_wiimotes[index].mutex);
 	auto& state = m_wiimotes[index].state;
 
-	const bool extension = state.m_extension.index() != 0; // TODO || HasMotionPlus();
+	const bool extension = state.m_extension.index() != 0 || state.m_motion_plus.has_value(); // MotionPlus data is sent in the extension bytes
 	const bool ir = state.ir_camera.mode != kIRDisabled;
 	const bool motion = true; // UseMotion();
 
@@ -1077,7 +1249,7 @@ IRMode WiimoteControllerProvider::set_ir_camera(size_t index, bool state)
 		mode = kIRDisabled;
 	else
 	{
-		mode = wiimote_state.m_extension.index() == 0 ? kExtendedIR : kBasicIR;
+		mode = (wiimote_state.m_extension.index() == 0 && !wiimote_state.m_motion_plus.has_value()) ? kExtendedIR : kBasicIR;
 	}
 
 	if (wiimote_state.ir_camera.mode == mode)

@@ -215,6 +215,12 @@ struct MotionPlusData
 	bool slow_pitch = false;
 	bool slow_yaw = false;
 	bool extension_connected = false;
+
+	// calibrated angular rates in rad/s (pitch, yaw, roll), updated by WiimoteControllerProvider::parse_motion_plus
+	glm::vec3 rate{};
+	glm::vec3 bias_dps{}; // gyro zero offset in deg/s (pitch, yaw, roll), estimated while the controller is still
+	uint32 bias_samples = 0;
+	bool valid = false; // at least one MotionPlus data frame has been received
 };
 
 struct NunchuckData
