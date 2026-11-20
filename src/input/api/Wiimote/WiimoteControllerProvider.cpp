@@ -23,6 +23,7 @@ namespace
 	{
 		float sign[3] = {1.0f, 1.0f, 1.0f}; // pitch -> x, yaw -> y, roll -> z
 		float gain = 1.0f;
+		bool signs_forced = false;
 		int frame = 1; // 1: sensor fusion in the Wiimote's own axes (gravity on Z when lying flat), 0: legacy frame used for the accelerometer
 	};
 
@@ -41,6 +42,7 @@ namespace
 				{
 					for (int i = 0; i < 3; ++i)
 						c.sign[i] = v[i] < 0.0f ? -1.0f : 1.0f;
+					c.signs_forced = true;
 				}
 			}
 			if (const char* env = std::getenv("CEMU_WIIMOTE_GYRO_GAIN"))
@@ -55,6 +57,75 @@ namespace
 			return c;
 		}();
 		return config;
+	}
+
+	// The gyro and the accelerometer must agree on the rotation directions, otherwise the sensor fusion goes wrong.
+	// A rotation w (rad/s, in the Wiimote's x/y/z axes) changes the measured gravity direction u by d(u) = -w x u.
+	// We fit the sign of each gyro axis to that relation (only used when CEMU_WIIMOTE_GYRO is not set).
+	// w: body axes (x = pitch, y = roll, z = yaw), raw signs as sent by the MotionPlus.
+	void update_auto_signs(MotionPlusData& mp, const glm::vec3& u, const glm::vec3& w, float dt)
+	{
+		const float mag = glm::length(u);
+		if (mag < 0.85f || mag > 1.15f)
+		{
+			mp.ac_have_prev = false; // the Wiimote is being accelerated, gravity is not reliable
+			return;
+		}
+		if (!mp.ac_have_prev)
+		{
+			mp.ac_prev_u = u;
+			mp.ac_have_prev = true;
+			return;
+		}
+		const glm::vec3 du = u - mp.ac_prev_u;
+		mp.ac_prev_u = u;
+
+		const glm::vec3 r[3] = {
+			-glm::vec3(0.0f, -u.z, u.y) * (w.x * dt),
+			-glm::vec3(u.z, 0.0f, -u.x) * (w.y * dt),
+			-glm::vec3(-u.y, u.x, 0.0f) * (w.z * dt)};
+		for (int i = 0; i < 3; ++i)
+		{
+			mp.ac_b[i] += glm::dot(r[i], du);
+			for (int j = 0; j < 3; ++j)
+				mp.ac_S[i][j] += glm::dot(r[i], r[j]);
+		}
+
+		// solve (S + lambda I) s = b
+		double A[3][3];
+		for (int i = 0; i < 3; ++i)
+			for (int j = 0; j < 3; ++j)
+				A[i][j] = mp.ac_S[i][j] + (i == j ? 1e-4 : 0.0);
+		const double det =
+			A[0][0] * (A[1][1] * A[2][2] - A[1][2] * A[2][1]) -
+			A[0][1] * (A[1][0] * A[2][2] - A[1][2] * A[2][0]) +
+			A[0][2] * (A[1][0] * A[2][1] - A[1][1] * A[2][0]);
+		if (std::abs(det) < 1e-12)
+			return;
+		double s[3];
+		for (int c = 0; c < 3; ++c)
+		{
+			double B[3][3];
+			for (int i = 0; i < 3; ++i)
+				for (int j = 0; j < 3; ++j)
+					B[i][j] = (j == c) ? mp.ac_b[i] : A[i][j];
+			s[c] =
+				(B[0][0] * (B[1][1] * B[2][2] - B[1][2] * B[2][1]) -
+				 B[0][1] * (B[1][0] * B[2][2] - B[1][2] * B[2][0]) +
+				 B[0][2] * (B[1][0] * B[2][1] - B[1][1] * B[2][0])) / det;
+		}
+		for (int i = 0; i < 3; ++i)
+		{
+			if (mp.ac_locked[i])
+				continue;
+			// enough rotation seen around this axis and a clear answer
+			if (mp.ac_S[i][i] > 0.03 && std::abs(s[i]) > 0.4)
+			{
+				mp.ac_sign[i] = s[i] > 0.0 ? 1.0f : -1.0f;
+				mp.ac_locked[i] = true;
+				cemuLog_log(LogType::Force, "Wiimote: gyro axis {} sign set to {} automatically (fit {:.2f})", i, mp.ac_sign[i], s[i]);
+			}
+		}
 	}
 
 	// Distance (in normalized camera coordinates, 1.0 = full width) under which two IR dots are considered to be the same light source.
@@ -848,16 +919,25 @@ void WiimoteControllerProvider::reader_thread()
 					{
 						const auto& cfg = get_gyro_config();
 						const auto& rate = new_state.m_motion_plus->rate; // pitch, yaw, roll (rad/s)
+						auto& mpd2 = *new_state.m_motion_plus;
+						float sg[3] = {cfg.sign[0], cfg.sign[1], cfg.sign[2]}; // pitch, yaw, roll
+						if (cfg.frame == 1 && !cfg.signs_forced)
+						{
+							update_auto_signs(mpd2, glm::vec3(tacc.x, tacc.y, tacc.z), glm::vec3(rate.x, rate.z, rate.y), dt);
+							sg[0] = mpd2.ac_sign[0]; // x = pitch
+							sg[2] = mpd2.ac_sign[1]; // y = roll
+							sg[1] = mpd2.ac_sign[2]; // z = yaw
+						}
 						if (cfg.frame == 1)
 						{
 							// work in the Wiimote's own axes: x (pitch axis), y (long axis = roll axis), z (out of the buttons = yaw axis).
-							// gravity then lies on z when the Wiimote is flat, as for the GamePad/SDL controllers (no gimbal lock).
+							// accelerometer axes as measured (z = +1 when lying flat face up): gravity then lies on z when the Wiimote is flat, as for the GamePad/SDL controllers (no gimbal lock).
 							new_state.motion_handler.processMotionSample(
 								dt,
-								rate.x * cfg.sign[0] * cfg.gain,
-								rate.z * cfg.sign[2] * cfg.gain,
-								rate.y * cfg.sign[1] * cfg.gain,
-								-tacc.x, -tacc.y, -tacc.z);
+								rate.x * sg[0] * cfg.gain,
+								rate.z * sg[2] * cfg.gain,
+								rate.y * sg[1] * cfg.gain,
+								tacc.x, tacc.y, tacc.z);
 						}
 						else
 						{
@@ -874,20 +954,22 @@ void WiimoteControllerProvider::reader_thread()
 				if (get_gyro_config().frame == 1)
 					new_state.motion_sample.overrideAccelerometer(acc, glm::length(tacc - pacc)); // the game keeps getting the accelerometer in the usual frame
 
-				// short diagnostic trace (about 2 per second during the first 30 seconds)
+				// short diagnostic trace (twice a second for 15 s, then once every 2 s)
 				static int s_dbgCount = 0;
 				static std::chrono::steady_clock::time_point s_dbgLast{};
 				const auto dbgNow = std::chrono::steady_clock::now();
-				if (motion_plus_updated && s_dbgCount < 60 && (dbgNow - s_dbgLast) > std::chrono::milliseconds(500))
+				const auto dbgInterval = s_dbgCount < 30 ? std::chrono::milliseconds(500) : std::chrono::milliseconds(2000);
+				if (motion_plus_updated && s_dbgCount < 400 && (dbgNow - s_dbgLast) > dbgInterval)
 				{
 					s_dbgLast = dbgNow;
 					++s_dbgCount;
 					float ori[3];
 					new_state.motion_sample.getVPADOrientation(ori);
 					const auto& mpd = *new_state.m_motion_plus;
-					cemuLog_log(LogType::Force, "gyrodbg rate(dps) {:.1f} {:.1f} {:.1f} bias {:.1f} {:.1f} {:.1f} acc {:.2f} {:.2f} {:.2f} ori {:.3f} {:.3f} {:.3f}",
-						mpd.rate.x * 57.2958f, mpd.rate.y * 57.2958f, mpd.rate.z * 57.2958f, mpd.bias_dps.x, mpd.bias_dps.y, mpd.bias_dps.z,
-						tacc.x, tacc.y, tacc.z, ori[0], ori[1], ori[2]);
+					cemuLog_log(LogType::Force, "gyrodbg rate(dps) {:.1f} {:.1f} {:.1f} acc {:.2f} {:.2f} {:.2f} ori {:.3f} {:.3f} {:.3f} fit S {:.3f} {:.3f} {:.3f} sign {} {} {}",
+						mpd.rate.x * 57.2958f, mpd.rate.y * 57.2958f, mpd.rate.z * 57.2958f,
+						tacc.x, tacc.y, tacc.z, ori[0], ori[1], ori[2],
+						mpd.ac_S[0][0], mpd.ac_S[1][1], mpd.ac_S[2][2], mpd.ac_sign[0], mpd.ac_sign[1], mpd.ac_sign[2]);
 				}
 			}
 			else

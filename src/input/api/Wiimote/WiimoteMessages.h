@@ -222,6 +222,14 @@ struct MotionPlusData
 	uint32 bias_samples = 0;
 	bool valid = false;
 	uint32 bad_frames = 0; // at least one MotionPlus data frame has been received
+
+	// automatic detection of the gyro axis signs (see update_auto_signs): least squares fit between the gyro and the accelerometer
+	double ac_S[3][3]{};
+	double ac_b[3]{};
+	glm::vec3 ac_prev_u{};
+	bool ac_have_prev = false;
+	float ac_sign[3] = {1.0f, 1.0f, 1.0f}; // for the body axes x (pitch), y (roll), z (yaw)
+	bool ac_locked[3] = {false, false, false};
 };
 
 struct NunchuckData
