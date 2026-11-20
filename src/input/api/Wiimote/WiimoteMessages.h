@@ -220,7 +220,8 @@ struct MotionPlusData
 	glm::vec3 rate{};
 	glm::vec3 bias_dps{}; // gyro zero offset in deg/s (pitch, yaw, roll), estimated while the controller is still
 	uint32 bias_samples = 0;
-	bool valid = false; // at least one MotionPlus data frame has been received
+	bool valid = false;
+	uint32 bad_frames = 0; // at least one MotionPlus data frame has been received
 };
 
 struct NunchuckData

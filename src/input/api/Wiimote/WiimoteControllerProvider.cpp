@@ -371,7 +371,8 @@ void WiimoteControllerProvider::reader_thread()
 					if (HAS_FLAG(new_state.flags, kExtensionConnected))
 					{
                         cemuLog_logDebug(LogType::Force,"Extension flag is set");
-						if(new_state.m_extension.index() == 0)
+						// do not re-initialise the extension port while MotionPlus is active: writing 0x55 to 0xA400F0 switches it off again
+						if(new_state.m_extension.index() == 0 && !new_state.m_motion_plus)
 							request_extension(index);
 					}
 					else
@@ -1036,9 +1037,18 @@ bool WiimoteControllerProvider::parse_motion_plus(WiimoteState& wiimote_state, c
 	// MotionPlus frame (extension bytes): bit1 of the last byte is set, bit0 is clear.
 	// Anything else is an inactive MotionPlus or a passthrough extension frame.
 	if ((data[5] & 0x03) != 0x02)
+	{
+		// MotionPlus stopped sending (switched off, reset...): after ~1.5 s forget it so that it is probed and activated again
+		if (++wiimote_state.m_motion_plus->bad_frames > 150)
+		{
+			cemuLog_log(LogType::Force, "Wiimote: MotionPlus stopped answering, will probe again");
+			wiimote_state.m_motion_plus.reset();
+		}
 		return false;
+	}
 
 	auto& mp = *wiimote_state.m_motion_plus;
+	mp.bad_frames = 0;
 	static bool s_loggedFirst = false;
 	if (!s_loggedFirst)
 	{
