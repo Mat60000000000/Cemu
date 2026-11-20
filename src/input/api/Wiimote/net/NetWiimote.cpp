@@ -250,3 +250,4 @@ std::vector<WiimoteDevicePtr> NetWiimote::get_devices()
 	}
 	return devices;
 }
+// rebuild
