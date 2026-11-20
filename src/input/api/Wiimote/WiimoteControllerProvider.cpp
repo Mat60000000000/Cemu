@@ -23,6 +23,7 @@ namespace
 	{
 		float sign[3] = {1.0f, 1.0f, 1.0f}; // pitch -> x, yaw -> y, roll -> z
 		float gain = 1.0f;
+		int frame = 1; // 1: sensor fusion in the Wiimote's own axes (gravity on Z when lying flat), 0: legacy frame used for the accelerometer
 	};
 
 	// Optional tuning through environment variables (read once):
@@ -48,7 +49,9 @@ namespace
 				if (g > 0.0f)
 					c.gain = g;
 			}
-			cemuLog_log(LogType::Force, "Wiimote gyro config: signs {} {} {}, gain {}", c.sign[0], c.sign[1], c.sign[2], c.gain);
+			if (const char* env = std::getenv("CEMU_WIIMOTE_FRAME"))
+				c.frame = std::atoi(env) == 0 ? 0 : 1;
+			cemuLog_log(LogType::Force, "Wiimote gyro config: signs {} {} {}, gain {}, frame {}", c.sign[0], c.sign[1], c.sign[2], c.gain, c.frame);
 			return c;
 		}();
 		return config;
@@ -845,15 +848,47 @@ void WiimoteControllerProvider::reader_thread()
 					{
 						const auto& cfg = get_gyro_config();
 						const auto& rate = new_state.m_motion_plus->rate; // pitch, yaw, roll (rad/s)
-						new_state.motion_handler.processMotionSample(
-							dt,
-							rate.x * cfg.sign[0] * cfg.gain,
-							rate.y * cfg.sign[1] * cfg.gain,
-							rate.z * cfg.sign[2] * cfg.gain,
-							acc[0], acc[1], acc[2]);
+						if (cfg.frame == 1)
+						{
+							// work in the Wiimote's own axes: x (pitch axis), y (long axis = roll axis), z (out of the buttons = yaw axis).
+							// gravity then lies on z when the Wiimote is flat, as for the GamePad/SDL controllers (no gimbal lock).
+							new_state.motion_handler.processMotionSample(
+								dt,
+								rate.x * cfg.sign[0] * cfg.gain,
+								rate.z * cfg.sign[2] * cfg.gain,
+								rate.y * cfg.sign[1] * cfg.gain,
+								-tacc.x, -tacc.y, -tacc.z);
+						}
+						else
+						{
+							new_state.motion_handler.processMotionSample(
+								dt,
+								rate.x * cfg.sign[0] * cfg.gain,
+								rate.y * cfg.sign[1] * cfg.gain,
+								rate.z * cfg.sign[2] * cfg.gain,
+								acc[0], acc[1], acc[2]);
+						}
 					}
 				}
 				new_state.motion_sample = new_state.motion_handler.getMotionSample();
+				if (get_gyro_config().frame == 1)
+					new_state.motion_sample.overrideAccelerometer(acc, glm::length(tacc - pacc)); // the game keeps getting the accelerometer in the usual frame
+
+				// short diagnostic trace (about 2 per second during the first 30 seconds)
+				static int s_dbgCount = 0;
+				static std::chrono::steady_clock::time_point s_dbgLast{};
+				const auto dbgNow = std::chrono::steady_clock::now();
+				if (motion_plus_updated && s_dbgCount < 60 && (dbgNow - s_dbgLast) > std::chrono::milliseconds(500))
+				{
+					s_dbgLast = dbgNow;
+					++s_dbgCount;
+					float ori[3];
+					new_state.motion_sample.getVPADOrientation(ori);
+					const auto& mpd = *new_state.m_motion_plus;
+					cemuLog_log(LogType::Force, "gyrodbg rate(dps) {:.1f} {:.1f} {:.1f} bias {:.1f} {:.1f} {:.1f} acc {:.2f} {:.2f} {:.2f} ori {:.3f} {:.3f} {:.3f}",
+						mpd.rate.x * 57.2958f, mpd.rate.y * 57.2958f, mpd.rate.z * 57.2958f, mpd.bias_dps.x, mpd.bias_dps.y, mpd.bias_dps.z,
+						tacc.x, tacc.y, tacc.z, ori[0], ori[1], ori[2]);
+				}
 			}
 			else
 			{

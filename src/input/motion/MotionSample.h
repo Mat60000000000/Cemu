@@ -219,6 +219,14 @@ public:
 		acc[1] = m_acc[1];
 		acc[2] = m_acc[2];
 	}
+	void overrideAccelerometer(const float acc[3], float accAcceleration)
+	{
+		m_acc[0] = acc[0];
+		m_acc[1] = acc[1];
+		m_acc[2] = acc[2];
+		m_accAcceleration = accAcceleration;
+	}
+
 	void getGyrometer(float gyro[3])
 	{
 		gyro[0] = m_gyro[0];
