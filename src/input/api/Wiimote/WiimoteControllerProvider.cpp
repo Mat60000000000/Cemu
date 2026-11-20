@@ -468,7 +468,7 @@ void WiimoteControllerProvider::reader_thread()
                             cemuLog_logDebug(LogType::Force,"Extension Type Received: Balance Board");
                             break;
 						case kExtensionMotionPlus:
-                            cemuLog_logDebug(LogType::Force,"Extension Type Received: MotionPlus");
+                            cemuLog_log(LogType::Force, "NetWiimote/Wiimote: MotionPlus detected, activating");
 							set_motion_plus(index, true);
 							new_state.m_motion_plus = MotionPlusData{};
 							break;
@@ -478,10 +478,10 @@ void WiimoteControllerProvider::reader_thread()
 							request_status(index);
 							break;
 						case kExtensionMotionPlusInactive:
-                            cemuLog_logDebug(LogType::Force,"Extension Type Received: Inactive MotionPlus");
+                            cemuLog_log(LogType::Force, "Wiimote: extension id = inactive MotionPlus");
 							break;
 						default:
-                            cemuLog_logDebug(LogType::Force,"Unknown extension: {:#x}", be_type.value());
+                            cemuLog_log(LogType::Force, "Wiimote: extension id {:#x}", be_type.value());
                             new_state.m_extension = {};
 							break;
 						}
@@ -965,7 +965,11 @@ void WiimoteControllerProvider::calculate_ir_position(WiimoteState& wiimote_stat
 		}
 	}
 
-	if (ir.dots[indices.first].visible && ir.dots[indices.second].visible)
+	const auto now = std::chrono::steady_clock::now();
+	const bool vis1 = ir.dots[indices.first].visible;
+	const bool vis2 = ir.dots[indices.second].visible;
+
+	if (vis1 && vis2)
 	{
 		ir.prev_dots[indices.first] = ir.dots[indices.first];
 		ir.prev_dots[indices.second] = ir.dots[indices.second];
@@ -975,20 +979,35 @@ void WiimoteControllerProvider::calculate_ir_position(WiimoteState& wiimote_stat
 		ir.distance = glm::length(ir.dots[indices.first].pos - ir.dots[indices.second].pos);
 		ir.indices = indices;
 		ir.m_positionVisibility = PositionVisibility::FULL;
+		ir.m_last_seen = now;
+		ir.m_has_fix = true;
+		return;
 	}
-	else if (ir.dots[indices.first].visible)
+
+	// only one tracked dot visible: estimate from its movement, but only if it really is the dot we were tracking
+	// (the dolphin bar shows extra dots, which used to make the pointer jump)
+	const sint32 single = vis1 ? indices.first : (vis2 ? indices.second : -1);
+	if (single >= 0 && ir.m_has_fix)
 	{
-		ir.position = ir.middle + (ir.dots[indices.first].pos - ir.prev_dots[indices.first].pos);
-		ir.m_positionVisibility = PositionVisibility::PARTIAL;
+		const auto& dot = ir.dots[single];
+		const auto& prev = ir.prev_dots[single];
+		if (glm::length(dot.pos - prev.pos) < 0.25f)
+		{
+			ir.position = ir.middle + (dot.pos - prev.pos);
+			ir.m_positionVisibility = PositionVisibility::PARTIAL;
+			ir.m_last_seen = now;
+			return;
+		}
 	}
-	else if (ir.dots[indices.second].visible)
+
+	// nothing usable: keep the last known position for a short time instead of making the cursor vanish
+	if (ir.m_has_fix && (now - ir.m_last_seen) < std::chrono::milliseconds(600))
 	{
-		ir.position = ir.middle + (ir.dots[indices.second].pos - ir.prev_dots[indices.second].pos);
 		ir.m_positionVisibility = PositionVisibility::PARTIAL;
+		return;
 	}
-	else {
-		ir.m_positionVisibility = PositionVisibility::NONE;
-	}
+
+	ir.m_positionVisibility = PositionVisibility::NONE;
 }
 
 
@@ -1003,6 +1022,12 @@ bool WiimoteControllerProvider::parse_motion_plus(WiimoteState& wiimote_state, c
 		return false;
 
 	auto& mp = *wiimote_state.m_motion_plus;
+	static bool s_loggedFirst = false;
+	if (!s_loggedFirst)
+	{
+		s_loggedFirst = true;
+		cemuLog_log(LogType::Force, "Wiimote: first valid MotionPlus frame received");
+	}
 
 	const uint16 yaw = (uint16)data[0] | ((uint16)(data[3] & 0xFC) << 6);
 	const uint16 roll = (uint16)data[1] | ((uint16)(data[4] & 0xFC) << 6);
@@ -1126,6 +1151,7 @@ void WiimoteControllerProvider::request_extension(size_t index)
 
 void WiimoteControllerProvider::detect_motion_plus(size_t index)
 {
+	cemuLog_log(LogType::Force, "Wiimote: probing for MotionPlus");
 	send_read_packet(index, kRegisterMemory, kRegisterMotionPlusDetect, 6);
 }
 

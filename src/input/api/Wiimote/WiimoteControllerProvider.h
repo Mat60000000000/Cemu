@@ -1,4 +1,5 @@
 #pragma once
+#include <chrono>
 
 #include "input/motion/MotionHandler.h"
 #include "input/api/Wiimote/WiimoteDevice.h"
@@ -62,6 +63,8 @@ public:
 			glm::vec2 middle {};
 			float distance = 0;
 			std::pair<sint32, sint32> indices{ 0,1 };
+			std::chrono::steady_clock::time_point m_last_seen{};
+			bool m_has_fix = false;
 		}ir_camera{};
 
 		std::optional<MotionPlusData> m_motion_plus;
