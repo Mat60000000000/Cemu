@@ -1,5 +1,6 @@
 #include "input/api/Wiimote/net/NetWiimote.h"
 #include "util/Socket/Socket.h"
+#include "util/helpers/helpers.h"
 
 #include <array>
 #include <atomic>
