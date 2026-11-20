@@ -1,6 +1,7 @@
 #include "input/api/Wiimote/WiimoteControllerProvider.h"
 #include "input/api/Wiimote/NativeWiimoteController.h"
 #include "input/api/Wiimote/WiimoteMessages.h"
+#include "input/api/Wiimote/net/NetWiimote.h"
 
 #ifdef HAS_HIDAPI
 #include "input/api/Wiimote/hidapi/HidapiWiimote.h"
@@ -196,6 +197,10 @@ void WiimoteControllerProvider::FindDevices()
 	const auto& l2capDevices = L2CapWiimote::get_devices();
 	std::ranges::move(l2capDevices, std::back_inserter(devices));
 #endif
+	// Wiimotes attached over the network (only active when CEMU_NETWIIMOTE is set)
+	const auto& netDevices = NetWiimote::get_devices();
+	std::ranges::move(netDevices, std::back_inserter(devices));
+
 	std::scoped_lock lock(m_connectedDeviceMutex);
 	m_connectedDevices = std::move(devices);
 }

@@ -72,6 +72,8 @@ if (HAS_WIIMOTE)
 			api/Wiimote/NativeWiimoteController.h
 			api/Wiimote/NativeWiimoteController.cpp
 			api/Wiimote/WiimoteDevice.h
+			api/Wiimote/net/NetWiimote.h
+			api/Wiimote/net/NetWiimote.cpp
 	)
 	if (ENABLE_HIDAPI)
 		target_sources(CemuInput PRIVATE
