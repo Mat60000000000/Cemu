@@ -443,7 +443,7 @@ void WiimoteControllerProvider::reader_thread()
 						auto be_type = *(betype<uint64>*)data;
 						data += 6; // 48
 						be_type >>= 16;
-						be_type &= 0xFFFFFFFFFFFF;
+						be_type &= 0xFFFFFFFF; // the two leading bytes vary between Wiimote models (e.g. 01 00 on Wiimote Plus)
 						switch (be_type.value())
 						{
 						case kExtensionNunchuck:
@@ -478,7 +478,18 @@ void WiimoteControllerProvider::reader_thread()
 							request_status(index);
 							break;
 						case kExtensionMotionPlusInactive:
-                            cemuLog_log(LogType::Force, "Wiimote: extension id = inactive MotionPlus");
+							{
+								// a MotionPlus that is present but not active: switch it on (rate limited, the probe repeats every second)
+								static std::chrono::steady_clock::time_point s_lastActivate{};
+								const auto now = std::chrono::steady_clock::now();
+								if (!new_state.m_motion_plus && (now - s_lastActivate) > std::chrono::seconds(2))
+								{
+									s_lastActivate = now;
+									cemuLog_log(LogType::Force, "Wiimote: inactive MotionPlus found, activating");
+									set_motion_plus(index, true);
+									new_state.m_motion_plus = MotionPlusData{};
+								}
+							}
 							break;
 						default:
                             cemuLog_log(LogType::Force, "Wiimote: extension id {:#x}", be_type.value());
@@ -1016,6 +1027,12 @@ bool WiimoteControllerProvider::parse_motion_plus(WiimoteState& wiimote_state, c
 	if (!wiimote_state.m_motion_plus)
 		return false;
 
+	static int s_rawLogged = 0;
+	if (s_rawLogged < 6 && (data[5] & 0x03) != 0x02)
+	{
+		++s_rawLogged;
+		cemuLog_log(LogType::Force, "Wiimote: ext bytes (not a MotionPlus frame): {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}", data[0], data[1], data[2], data[3], data[4], data[5]);
+	}
 	// MotionPlus frame (extension bytes): bit1 of the last byte is set, bit0 is clear.
 	// Anything else is an inactive MotionPlus or a passthrough extension frame.
 	if ((data[5] & 0x03) != 0x02)
